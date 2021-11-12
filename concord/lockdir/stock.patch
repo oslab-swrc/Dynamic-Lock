@@ -1,0 +1,223 @@
+diff --git a/src/linux/arch/x86/include/asm/qspinlock.h b/src/linux/arch/x86/include/asm/qspinlock.h
+index 444d6fd9a..bb0b7186c 100644
+--- a/src/linux/arch/x86/include/asm/qspinlock.h
++++ b/src/linux/arch/x86/include/asm/qspinlock.h
+@@ -85,7 +85,7 @@ void native_pv_lock_init(void) __init;
+ #define virt_spin_lock virt_spin_lock
+ static inline bool virt_spin_lock(struct qspinlock *lock)
+ {
+-	if (!static_branch_likely(&virt_spin_lock_key))
++	if (!likely(static_key_enabled(&virt_spin_lock_key)))
+ 		return false;
+ 
+ 	/*
+diff --git a/src/linux/include/asm-generic/qspinlock.h b/src/linux/include/asm-generic/qspinlock.h
+index fde943d18..3b7cdddeb 100644
+--- a/src/linux/include/asm-generic/qspinlock.h
++++ b/src/linux/include/asm-generic/qspinlock.h
+@@ -65,34 +65,13 @@ static __always_inline int queued_spin_trylock(struct qspinlock *lock)
+ 	return likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL));
+ }
+ 
+-extern void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
+-
+-/**
+- * queued_spin_lock - acquire a queued spinlock
+- * @lock: Pointer to queued spinlock structure
+- */
+-static __always_inline void queued_spin_lock(struct qspinlock *lock)
+-{
+-	u32 val = 0;
+-
+-	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
+-		return;
+-
+-	queued_spin_lock_slowpath(lock, val);
+-}
++extern void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val, int custom);
++extern void bpf_queued_spin_lock(struct qspinlock *lock);
++extern void bpf_queued_spin_unlock(struct qspinlock *lock);
++extern void queued_spin_lock(struct qspinlock *lock);
+ 
+ #ifndef queued_spin_unlock
+-/**
+- * queued_spin_unlock - release a queued spinlock
+- * @lock : Pointer to queued spinlock structure
+- */
+-static __always_inline void queued_spin_unlock(struct qspinlock *lock)
+-{
+-	/*
+-	 * unlock() needs release semantics:
+-	 */
+-	smp_store_release(&lock->locked, 0);
+-}
++extern void queued_spin_unlock(struct qspinlock *lock);
+ #endif
+ 
+ #ifndef virt_spin_lock
+diff --git a/src/linux/include/linux/seqlock.h b/src/linux/include/linux/seqlock.h
+index bcf4cf26b..142f7c114 100644
+--- a/src/linux/include/linux/seqlock.h
++++ b/src/linux/include/linux/seqlock.h
+@@ -455,6 +455,19 @@ static inline void write_sequnlock(seqlock_t *sl)
+ 	spin_unlock(&sl->lock);
+ }
+ 
++static inline void bpf_write_seqlock(seqlock_t *sl)
++{
++	bpf_queued_spin_lock(&sl->lock.rlock.raw_lock);
++	write_seqcount_begin(&sl->seqcount);
++}
++
++static inline void bpf_write_sequnlock(seqlock_t *sl)
++{
++	write_seqcount_end(&sl->seqcount);
++	bpf_queued_spin_unlock(&sl->lock.rlock.raw_lock);
++}
++
++
+ static inline void write_seqlock_bh(seqlock_t *sl)
+ {
+ 	spin_lock_bh(&sl->lock);
+diff --git a/src/linux/kernel/locking/mcs_spinlock.h b/src/linux/kernel/locking/mcs_spinlock.h
+index 5e10153b4..e513cc7d5 100644
+--- a/src/linux/kernel/locking/mcs_spinlock.h
++++ b/src/linux/kernel/locking/mcs_spinlock.h
+@@ -19,6 +19,7 @@ struct mcs_spinlock {
+ 	struct mcs_spinlock *next;
+ 	int locked; /* 1 if lock acquired */
+ 	int count;  /* nesting count, see qspinlock.c */
++	void *bpf_args;
+ };
+ 
+ #ifndef arch_mcs_spin_lock_contended
+diff --git a/src/linux/kernel/locking/qspinlock.c b/src/linux/kernel/locking/qspinlock.c
+index 2473f10c6..976359cdb 100644
+--- a/src/linux/kernel/locking/qspinlock.c
++++ b/src/linux/kernel/locking/qspinlock.c
+@@ -290,6 +290,35 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
+ 
+ #endif /* _GEN_PV_LOCK_SLOWPATH */
+ 
++/* Concord APIs
++* livepatch will use custom_xxx functions to insert user policy
++* */
++
++typedef int (*lock_acquire_func)(struct qspinlock *);
++typedef int (*lock_contended_func)(struct qspinlock *, struct mcs_spinlock *);
++typedef int (*lock_acquired_func)(struct qspinlock *);
++typedef int (*lock_release_func)(struct qspinlock *);
++
++static int custom_lock_acquire(struct qspinlock *lock)
++{
++	return 0;
++}
++
++static int custom_lock_contended(struct qspinlock *lock, struct mcs_spinlock *node)
++{
++	return 0;
++}
++
++static int custom_lock_acquired(struct qspinlock *lock)
++{
++	return 0;
++}
++
++static int custom_lock_release(struct qspinlock *lock)
++{
++	return 0;
++}
++
+ /**
+  * queued_spin_lock_slowpath - acquire the queued spinlock
+  * @lock: Pointer to queued spinlock structure
+@@ -311,7 +340,7 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
+  * contended             :    (*,x,y) +--> (*,0,0) ---> (*,0,1) -'  :
+  *   queue               :         ^--'                             :
+  */
+-void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
++void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val, int custom)
+ {
+ 	struct mcs_spinlock *prev, *next, *node;
+ 	u32 old, tail;
+@@ -434,6 +463,12 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+ 	node->next = NULL;
+ 	pv_init_node(node);
+ 
++	if (custom){
++		lock_contended_func contended_func;
++		contended_func = &custom_lock_contended;
++		contended_func(lock, node);
++	}
++
+ 	/*
+ 	 * We touched a (possibly) cold cacheline in the per-cpu queue node;
+ 	 * attempt the trylock once more in the hope someone let go while we
+@@ -560,6 +595,67 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+ }
+ EXPORT_SYMBOL(queued_spin_lock_slowpath);
+ 
++void bpf_queued_spin_lock(struct qspinlock *lock)
++{
++	u32 val = 0;
++	lock_acquire_func acq_func;
++	lock_acquired_func acqed_func;
++
++	acq_func = &custom_lock_acquire;
++	acqed_func = &custom_lock_acquired;
++
++	acq_func(lock);
++
++	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL))){
++		acqed_func(lock);
++		return;
++	}
++
++	queued_spin_lock_slowpath(lock, val, 1);
++	acqed_func(lock);
++
++}
++EXPORT_SYMBOL(bpf_queued_spin_lock);
++
++void bpf_queued_spin_unlock(struct qspinlock *lock)
++{
++	lock_release_func rel_func;
++	rel_func = &custom_lock_release;
++	rel_func(lock);
++
++	smp_store_release(&lock->locked, 0);
++}
++EXPORT_SYMBOL(bpf_queued_spin_unlock);
++
++/**
++ * queued_spin_lock - acquire a queued spinlock
++ * @lock: Pointer to queued spinlock structure
++ */
++void queued_spin_lock(struct qspinlock *lock)
++{
++	u32 val = 0;
++
++	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
++		return;
++
++	queued_spin_lock_slowpath(lock, val, 0);
++}
++EXPORT_SYMBOL(queued_spin_lock);
++
++/**
++ * queued_spin_unlock - release a queued spinlock
++ * @lock : Pointer to queued spinlock structure
++ */
++void queued_spin_unlock(struct qspinlock *lock)
++{
++	/*
++	 * unlock() needs release semantics:
++	 */
++	smp_store_release(&lock->locked, 0);
++}
++EXPORT_SYMBOL(queued_spin_unlock);
++
++
+ /*
+  * Generate the paravirt code for queued_spin_unlock_slowpath().
+  */

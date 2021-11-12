@@ -1,0 +1,5 @@
+SEC("lock_rwsem_global")
+bool custom_cmp_func(struct __lock_policy_args *args)
+{
+    return false;
+}

@@ -1,0 +1,915 @@
+diff --git a/src/linux/include/asm-generic/qspinlock.h b/src/linux/include/asm-generic/qspinlock.h
+index fde943d..3b7cddd 100644
+--- a/src/linux/include/asm-generic/qspinlock.h
++++ b/src/linux/include/asm-generic/qspinlock.h
+@@ -65,34 +65,13 @@ static __always_inline int queued_spin_trylock(struct qspinlock *lock)
+ 	return likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL));
+ }
+ 
+-extern void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val);
+-
+-/**
+- * queued_spin_lock - acquire a queued spinlock
+- * @lock: Pointer to queued spinlock structure
+- */
+-static __always_inline void queued_spin_lock(struct qspinlock *lock)
+-{
+-	u32 val = 0;
+-
+-	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
+-		return;
+-
+-	queued_spin_lock_slowpath(lock, val);
+-}
++extern void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val, int custom);
++extern void bpf_queued_spin_lock(struct qspinlock *lock);
++extern void bpf_queued_spin_unlock(struct qspinlock *lock);
++extern void queued_spin_lock(struct qspinlock *lock);
+ 
+ #ifndef queued_spin_unlock
+-/**
+- * queued_spin_unlock - release a queued spinlock
+- * @lock : Pointer to queued spinlock structure
+- */
+-static __always_inline void queued_spin_unlock(struct qspinlock *lock)
+-{
+-	/*
+-	 * unlock() needs release semantics:
+-	 */
+-	smp_store_release(&lock->locked, 0);
+-}
++extern void queued_spin_unlock(struct qspinlock *lock);
+ #endif
+ 
+ #ifndef virt_spin_lock
+diff --git a/src/linux/include/linux/rwsem.h b/src/linux/include/linux/rwsem.h
+index 09d5709..15a220f 100644
+--- a/src/linux/include/linux/rwsem.h
++++ b/src/linux/include/linux/rwsem.h
+@@ -199,33 +199,39 @@ static inline int rwsem_is_contended(struct rw_semaphore *sem)
+  * lock for reading
+  */
+ extern void down_read(struct rw_semaphore *sem);
++extern void bpf_down_read(struct rw_semaphore *sem);
+ extern int __must_check down_read_killable(struct rw_semaphore *sem);
+ 
+ /*
+  * trylock for reading -- returns 1 if successful, 0 if contention
+  */
+ extern int down_read_trylock(struct rw_semaphore *sem);
++extern int bpf_down_read_trylock(struct rw_semaphore *sem);
+ 
+ /*
+  * lock for writing
+  */
+ extern void down_write(struct rw_semaphore *sem);
++extern void bpf_down_write(struct rw_semaphore *sem);
+ extern int __must_check down_write_killable(struct rw_semaphore *sem);
+ 
+ /*
+  * trylock for writing -- returns 1 if successful, 0 if contention
+  */
+ extern int down_write_trylock(struct rw_semaphore *sem);
++extern int bpf_down_write_trylock(struct rw_semaphore *sem);
+ 
+ /*
+  * release a read lock
+  */
+ extern void up_read(struct rw_semaphore *sem);
++extern void bpf_up_read(struct rw_semaphore *sem);
+ 
+ /*
+  * release a write lock
+  */
+ extern void up_write(struct rw_semaphore *sem);
++extern void bpf_up_write(struct rw_semaphore *sem);
+ 
+ /*
+  * downgrade write lock to read lock
+diff --git a/src/linux/include/linux/seqlock.h b/src/linux/include/linux/seqlock.h
+index bcf4cf2..142f7c1 100644
+--- a/src/linux/include/linux/seqlock.h
++++ b/src/linux/include/linux/seqlock.h
+@@ -455,6 +455,19 @@ static inline void write_sequnlock(seqlock_t *sl)
+ 	spin_unlock(&sl->lock);
+ }
+ 
++static inline void bpf_write_seqlock(seqlock_t *sl)
++{
++	bpf_queued_spin_lock(&sl->lock.rlock.raw_lock);
++	write_seqcount_begin(&sl->seqcount);
++}
++
++static inline void bpf_write_sequnlock(seqlock_t *sl)
++{
++	write_seqcount_end(&sl->seqcount);
++	bpf_queued_spin_unlock(&sl->lock.rlock.raw_lock);
++}
++
++
+ static inline void write_seqlock_bh(seqlock_t *sl)
+ {
+ 	spin_lock_bh(&sl->lock);
+diff --git a/src/linux/kernel/locking/mcs_spinlock.h b/src/linux/kernel/locking/mcs_spinlock.h
+index 7caf749..e2612fe 100644
+--- a/src/linux/kernel/locking/mcs_spinlock.h
++++ b/src/linux/kernel/locking/mcs_spinlock.h
+@@ -29,6 +29,7 @@ struct mcs_spinlock {
+ 
+ 	int nid;
+ 	int cid;
++	void *bpf_args;
+ 	struct mcs_spinlock *last_visited;
+ };
+ 
+diff --git a/src/linux/kernel/locking/qspinlock.c b/src/linux/kernel/locking/qspinlock.c
+index 174032e..a017d99 100644
+--- a/src/linux/kernel/locking/qspinlock.c
++++ b/src/linux/kernel/locking/qspinlock.c
+@@ -170,6 +170,45 @@ static bool probably(void)
+ 	return true;
+ }
+ 
++/* Concord APIs
++ * livepatch will use custom_xxx functions to insert user policy
++ * */
++typedef bool (*shuffler_cmp_func)(struct qspinlock *, struct mcs_spinlock *, struct mcs_spinlock *);
++
++typedef int (*lock_acquire_func)(struct qspinlock *);
++typedef int (*lock_contended_func)(struct qspinlock *, struct mcs_spinlock *);
++typedef int (*lock_acquired_func)(struct qspinlock *);
++typedef int (*lock_release_func)(struct qspinlock *);
++
++static bool numa_cmp_func(struct qspinlock* lock, struct mcs_spinlock *node, struct mcs_spinlock *curr)
++{
++	return (node->nid == curr->nid);
++}
++
++static bool custom_lock_cmp(struct qspinlock* lock, struct mcs_spinlock *node, struct mcs_spinlock *curr)
++{
++	return false;
++}
++
++static int custom_lock_acquire(struct qspinlock *lock)
++{
++	return 0;
++}
++
++static int custom_lock_contended(struct qspinlock *lock, struct mcs_spinlock *node)
++{
++	return 0;
++}
++
++static int custom_lock_acquired(struct qspinlock *lock)
++{
++	return 0;
++}
++
++static int custom_lock_release(struct qspinlock *lock)
++{
++	return 0;
++}
+ 
+ /*
+  * This function is responsible for aggregating waiters in a
+@@ -184,13 +223,22 @@ static bool probably(void)
+  * of sockets.
+  */
+ static void shuffle_waiters(struct qspinlock *lock, struct mcs_spinlock *node,
+-			    int is_next_waiter)
++			    int is_next_waiter, int custom)
+ {
+ 	struct mcs_spinlock *curr, *prev, *next, *last, *sleader, *qend;
+ 	int nid;
+ 	int curr_locked_count;
+ 	int one_shuffle = false;
+ 
++	shuffler_cmp_func cmp;
++
++	if(custom){
++		cmp = &numa_cmp_func;
++	}
++	else{
++		cmp = &numa_cmp_func;
++	}
++
+ 	prev = smp_load_acquire(&node->last_visited);
+ 	if (!prev)
+ 		prev = node;
+@@ -297,14 +345,14 @@ static void shuffle_waiters(struct qspinlock *lock, struct mcs_spinlock *node,
+ 		/* got the current for sure */
+ 
+ 		/* Check if curr->nid is same as nid */
+-		if (curr->nid == nid) {
++		if (cmp(lock, node, curr)) {
+ 
+ 			/*
+ 			 * if prev->nid == curr->nid, then
+ 			 * just update the last and prev
+ 			 * and proceed forward
+ 			 */
+-			if (prev->nid == nid) {
++			if (prev == last) {
+ 				set_waitcount(curr, curr_locked_count);
+ 
+ 				last = curr;
+@@ -595,7 +643,7 @@ static __always_inline u32  __pv_wait_head_or_lock(struct qspinlock *lock,
+  * contended             :    (*,x,y) +--> (*,0,0) ---> (*,0,1) -'  :
+  *   queue               :         ^--'                             :
+  */
+-void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
++void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val, int custom)
+ {
+ 	struct mcs_spinlock *prev, *next, *node;
+ 	u32 old, tail;
+@@ -721,8 +769,15 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+ 	node->last_visited = NULL;
+ 	node->locked = 0;
+ 	node->next = NULL;
++	node->bpf_args = NULL;
+ 	pv_init_node(node);
+ 
++	if(custom){
++		lock_contended_func contended_func;
++		contended_func = &custom_lock_contended;
++
++		contended_func(lock, node);
++	}
+ 	/*
+ 	 * We touched a (possibly) cold cacheline in the per-cpu queue node;
+ 	 * attempt the trylock once more in the hope someone let go while we
+@@ -767,7 +822,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+ 				break;
+ 
+ 			if (READ_ONCE(node->sleader))
+-				shuffle_waiters(lock, node, false);
++				shuffle_waiters(lock, node, false, custom);
+ 
+ 			cpu_relax();
+ 		}
+@@ -819,7 +874,7 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+ 		wcount = READ_ONCE(node->wcount);
+ 		if (!wcount ||
+ 		    (wcount && node->sleader))
+-			shuffle_waiters(lock, node, true);
++			shuffle_waiters(lock, node, true, custom);
+ 		cpu_relax();
+ 	}
+ 	smp_acquire__after_ctrl_dep();
+@@ -879,6 +934,66 @@ void queued_spin_lock_slowpath(struct qspinlock *lock, u32 val)
+ }
+ EXPORT_SYMBOL(queued_spin_lock_slowpath);
+ 
++void bpf_queued_spin_lock(struct qspinlock *lock)
++{
++	u32 val = 0;
++	lock_acquire_func acq_func;
++	lock_acquired_func acqed_func;
++
++	acq_func = &custom_lock_acquire;
++	acqed_func = &custom_lock_acquired;
++
++	acq_func(lock);
++
++	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL))){
++		acqed_func(lock);
++		return;
++	}
++
++	queued_spin_lock_slowpath(lock, val, 1);
++	acqed_func(lock);
++
++}
++EXPORT_SYMBOL(bpf_queued_spin_lock);
++
++void bpf_queued_spin_unlock(struct qspinlock *lock)
++{
++	lock_release_func rel_func;
++	rel_func = &custom_lock_release;
++	rel_func(lock);
++
++	smp_store_release(&lock->locked, 0);
++}
++EXPORT_SYMBOL(bpf_queued_spin_unlock);
++
++/**
++ * queued_spin_lock - acquire a queued spinlock
++ * @lock: Pointer to queued spinlock structure
++ */
++void queued_spin_lock(struct qspinlock *lock)
++{
++	u32 val = 0;
++
++	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
++		return;
++
++	queued_spin_lock_slowpath(lock, val, 0);
++}
++EXPORT_SYMBOL(queued_spin_lock);
++
++/**
++ * queued_spin_unlock - release a queued spinlock
++ * @lock : Pointer to queued spinlock structure
++ */
++void queued_spin_unlock(struct qspinlock *lock)
++{
++	/*
++	 * unlock() needs release semantics:
++	 */
++	smp_store_release(&lock->locked, 0);
++}
++EXPORT_SYMBOL(queued_spin_unlock);
++
+ /*
+  * Generate the paravirt code for queued_spin_unlock_slowpath().
+  */
+diff --git a/src/linux/kernel/locking/rwsem.c b/src/linux/kernel/locking/rwsem.c
+index 7304e7e..bc94cee 100644
+--- a/src/linux/kernel/locking/rwsem.c
++++ b/src/linux/kernel/locking/rwsem.c
+@@ -63,7 +63,145 @@ static inline bool probably(unsigned int range)
+ 	return xor_random() & (range - 1);
+ }
+ 
+-// APIs will be added here
++/** APIs will be added here */
++
++/* Concord APIs
++ * livepatch will use custom_xxx functions to insert user policy
++ * */
++typedef bool (*shuffler_cmp_func)(struct rwaqm_node *, struct rwaqm_node *);
++typedef bool (*skip_shuffle_func)(struct rwaqm_node *);
++typedef bool (*break_shuffle_func)(struct rwaqm_node *, struct rwaqm_node *);
++typedef bool (*fastpath_func)(struct rwmutex *);
++typedef bool (*shuffle_waiters_func)(struct rwmutex *, struct rwaqm_node *, int);
++
++typedef int (*lock_acquire_func)(struct rw_semaphore *);
++typedef int (*lock_contended_func)(struct rw_semaphore *);
++typedef int (*lock_acquired_func)(struct rw_semaphore *);
++typedef int (*lock_release_func)(struct rw_semaphore *);
++
++/*
++ * XXX_cmp_func - Decide whether to move curr or not.
++ * @node: shuffler node
++ * @curr: current node accessed by shuffler
++ *
++ * shuffler node checks curr node and decide whether to move it forward or not.
++ * When the function returns true, curr node joins the shuffler's group.
++ * Otherwise, it stays on its place.
++ *
++ * */
++bool numa_cmp_func(struct rwaqm_node *node, struct rwaqm_node *curr)
++{
++	/** default */
++	return (node->nid == curr->nid);
++}
++
++bool custom_cmp_func(struct rwaqm_node *node, struct rwaqm_node *curr)
++{
++	return false;
++}
++
++/** Skip shuffle */
++bool default_skip_func(struct rwaqm_node *node)
++{
++	if (!probably(INTRA_SOCKET_HANDOFF_PROB_ARG))
++		return true;
++
++	return false;
++}
++
++bool counter_skip_func(struct rwaqm_node *node)
++{
++
++	int curr_locked_count = node->wcount;
++
++	if(curr_locked_count >= _AQ_MAX_LOCK_COUNT)
++		return true;
++
++	return false;
++}
++
++bool custom_skip_func(struct rwaqm_node *node)
++{
++	return false;
++}
++
++/** break shuffle */
++bool default_break_func(struct rwaqm_node *node, struct rwaqm_node *curr)
++{
++
++	return false;
++}
++
++bool custom_break_func(struct rwaqm_node *node, struct rwaqm_node *curr)
++{
++
++	return false;
++}
++
++/** Fastpath */
++bool enable_fastpath(struct rwmutex *lock)
++{
++	/** default */
++	return true;
++}
++
++bool disable_fastpath(struct rwmutex *lock)
++{
++	return false;
++}
++
++/*
++ * custom_lock_acquire - Called before actually acquire a lock
++ *
++ * This function is called when a lock acquire function is called,
++ * but right before the lock is really acquired.
++ * By default, it returns 0.
++ *
++ * This function might be used to bypass underlying lock by returning non-zero
++ * value, but in this case, safety is up to users.
++ *
++ * */
++int custom_lock_acquire(struct rw_semaphore *lock)
++{
++	return 0;
++}
++
++/*
++ * custom_lock_contended - Called when lock is contended.
++ *
++ * This function is called when a lock is contended (already held by other
++ * thread), so the current thread failed to acquire it in the fastpath.
++ * By default, it returns 0.
++ *
++ * */
++int custom_lock_contended(struct rw_semaphore *lock)
++{
++	return 0;
++}
++
++/*
++ * custom_lock_acquired - Called right after acquire a lock
++ *
++ * */
++int custom_lock_acquired(struct rw_semaphore *lock)
++{
++	return 0;
++}
++
++/*
++ * custom_lock_release - Called before actually acquire a lock
++ *
++ * This function is called when a lock release function is called,
++ * but right before really release the lock.
++ * By default, it returns 0.
++ * This function might be used to bypass underlying lock by returning non-zero
++ * value, but in this case, safety is up to users.
++ *
++ * */
++int custom_lock_release(struct rw_semaphore *lock)
++{
++	return 0;
++}
+ 
+ static inline u32 mix32a(u32 v)
+ {
+@@ -73,7 +211,7 @@ static inline u32 mix32a(u32 v)
+     return v;
+ }
+ 
+-static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader);
++static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader, int custom);
+ 
+ static void __rwmutex_init(struct rwmutex *lock)
+ {
+@@ -89,15 +227,24 @@ static inline bool __rwmutex_trylock(struct rwmutex *lock)
+ 	return (atomic_cmpxchg(&lock->val, 0, 1) == 0);
+ }
+ 
+-static inline void rwmutex_lock(struct rwmutex *lock, int is_reader)
++static inline void rwmutex_lock(struct rwmutex *lock, int is_reader, int custom)
+ {
+-	if (likely(cmpxchg(&lock->locked_no_stealing, 0, 1) == 0))
+-		return;
++	if(custom){
++		fastpath_func allow_stealing;
++		allow_stealing = &enable_fastpath;
+ 
+-	__aqm_lock_slowpath(lock, TASK_UNINTERRUPTIBLE, is_reader);
++		if (allow_stealing(lock) && likely(cmpxchg(&lock->locked_no_stealing, 0, 1) == 0))
++			return;
++	}
++	else{
++		if (likely(cmpxchg(&lock->locked_no_stealing, 0, 1) == 0))
++			return;
++	}
++
++	__aqm_lock_slowpath(lock, TASK_UNINTERRUPTIBLE, is_reader, custom);
+ }
+ 
+-static inline void rwmutex_unlock(struct rwmutex *lock)
++static inline void rwmutex_unlock(struct rwmutex *lock, int custom)
+ {
+ 	/* xchg(&lock->locked, 0); */
+ 	smp_store_release(&lock->locked, 0);
+@@ -181,38 +328,8 @@ static inline void park_waiter(struct rwaqm_node *node, long state)
+         set_current_state(TASK_RUNNING);
+ }
+ 
+-static bool skip_shuffle(struct rwaqm_node *node){
+-	// User configurable APIs
+-	// Return true to skip shuffling for node
+-	bool skip = false;
+-
+-	/*
+-	 * In case the curr_locked_count has crossed a
+-	 * threshold, which is certainly impossible in this
+-	 * design, then load the very next of the node and pass
+-	 * the shuffling responsibility to that @next.
+-	 */
+-#ifdef USE_COUNTER
+-	if (curr_locked_count >= _AQ_MAX_LOCK_COUNT)
+-		skip = true;
+-#else
+-	if (!probably(INTRA_SOCKET_HANDOFF_PROB_ARG))
+-		skip = true;
+-#endif
+-
+-	return skip;
+-}
+-
+-static bool can_mv_curr(struct rwaqm_node *node, struct rwaqm_node *curr){
+-	// User configurable APIs
+-	// Return true if curr is eligible to move forward(join node's group)
+-
+-	// compare node id
+-	return (node->nid == curr->nid);
+-}
+-
+ static inline void shuffle_waiters(struct rwmutex *lock, struct rwaqm_node *node,
+-				   int is_next_waiter)
++				   int is_next_waiter, int custom)
+ {
+ 	struct rwaqm_node *curr, *prev, *next, *last, *sleader;
+ 	int nid;
+@@ -220,6 +337,22 @@ static inline void shuffle_waiters(struct rwmutex *lock, struct rwaqm_node *node
+ 	int one_shuffle = false;
+ 	int woke_up_one = false;
+ 
++	/** ============ Shuffling APIs ================ */
++	shuffler_cmp_func cmp;
++	skip_shuffle_func skip;
++	break_shuffle_func stop;
++
++	if(custom){
++		cmp = &numa_cmp_func;
++		skip = &default_skip_func;
++		stop = &default_break_func;
++	}
++	else{
++		cmp = &numa_cmp_func;
++		skip = &default_skip_func;
++		stop = &default_break_func;
++	}
++
+ 	prev = node;
+ 	last = node;
+ 	curr = NULL;
+@@ -251,7 +384,7 @@ static inline void shuffle_waiters(struct rwmutex *lock, struct rwaqm_node *node
+ 	 */
+ 	clear_sleader(node);
+ 
+-	if(skip_shuffle(node)){
++	if(skip(node)){
+ 		sleader = smp_load_acquire(&node->next);
+ 		goto out;
+ 	}
+@@ -294,10 +427,16 @@ static inline void shuffle_waiters(struct rwmutex *lock, struct rwaqm_node *node
+ 			break;
+ 		}
+ 
++		/** Custom break condition */
++		if(stop(node, curr)){
++			sleader = last;
++			break;
++		}
++
+ 		/* got the current for sure */
+ 
+ 		/* Check if curr->nid is same as nid */
+-		if(can_mv_curr(node, curr)){
++		if(cmp(node, curr)){
+ 			/*
+ 			 * if prev == last, then
+ 			 * just update the last and prev
+@@ -385,7 +524,7 @@ static inline void shuffle_waiters(struct rwmutex *lock, struct rwaqm_node *node
+ 	}
+ }
+ 
+-static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader)
++static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader, int custom)
+ {
+ 	struct rwaqm_node snode ____cacheline_aligned;
+ 	struct rwaqm_node *node = &snode;
+@@ -400,8 +539,18 @@ static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader)
+ 	node->nid = numa_node_id();
+ 	node->is_reader = is_reader;
+ 	node->task = current;
++
++	/** Additional data per node */
+ 	node->bpf_args = NULL;
+ 
++	fastpath_func allow_stealing;
++
++	if(custom){
++		allow_stealing = &enable_fastpath;
++	}
++	else{
++		allow_stealing = &enable_fastpath;
++	}
+ 	/*
+ 	 * Ensure that the initialisation of @node is complete before we
+ 	 * publish the updated tail via xchg_tail() and potentially link
+@@ -437,7 +586,8 @@ static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader)
+ 			cpu_relax();
+ 		}
+ 	} else {
+-		disable_stealing(lock);
++		if(allow_stealing(lock))
++			disable_stealing(lock);
+ 	}
+ 
+ 	/*
+@@ -462,7 +612,7 @@ static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader)
+ 
+ 		if (sleader) {
+ 			sleader = false;
+-			shuffle_waiters(lock, node, true);
++			shuffle_waiters(lock, node, true, custom);
+ 		}
+ 	}
+ 
+@@ -483,7 +633,8 @@ static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader)
+ 	next = smp_load_acquire(&node->next);
+ 	if (!next) {
+ 		if (cmpxchg(&lock->tail, node, NULL) == node) {
+-			enable_stealing(lock);
++			if(allow_stealing(lock))
++				enable_stealing(lock);
+ 			goto out;
+ 		}
+ 
+@@ -512,11 +663,18 @@ static int __aqm_lock_slowpath(struct rwmutex *lock, long state, int is_reader)
+ 	return 0;
+ }
+ 
+-static inline void aqm_read_lock_slowpath(struct rw_semaphore *sem)
++static inline void aqm_read_lock_slowpath(struct rw_semaphore *sem, int custom)
+ {
++	if(custom){
++		/** ============ Profiling APIs ================ */
++		lock_contended_func contended_func;
++		contended_func = &custom_lock_contended;
++		contended_func(sem);
++	}
++
+ 	atomic_sub(RWAQM_R_BIAS, &sem->cnts);
+ 
+-	rwmutex_lock(&sem->wait_lock, true);
++	rwmutex_lock(&sem->wait_lock, true, custom);
+ 	atomic_add(RWAQM_R_BIAS, &sem->cnts);
+ 
+ 	/* atomic_cond_read_acquire(&sem->cnts, !(VAL & RWAQM_W_LOCKED)); */
+@@ -530,7 +688,7 @@ static inline void aqm_read_lock_slowpath(struct rw_semaphore *sem)
+ 		cpu_relax();
+ 	}
+ 
+-	rwmutex_unlock(&sem->wait_lock);
++	rwmutex_unlock(&sem->wait_lock, custom);
+ }
+ 
+ void down_read(struct rw_semaphore *sem)
+@@ -543,11 +701,37 @@ void down_read(struct rw_semaphore *sem)
+ 	if (likely(!(cnts & RWAQM_W_WMASK)))
+ 		return;
+ 
+-	aqm_read_lock_slowpath(sem);
++	aqm_read_lock_slowpath(sem, 0);
+ }
+ EXPORT_SYMBOL(down_read);
+ 
+ 
++void bpf_down_read(struct rw_semaphore *sem)
++{
++	u32 cnts;
++
++	/** ============ Profiling APIs ================ */
++	lock_acquire_func acq_func;
++	lock_acquired_func acqed_func;
++
++	acq_func = &custom_lock_acquire;
++	acqed_func = &custom_lock_acquired;
++
++	acq_func(sem);
++
++	might_sleep();
++
++	cnts = atomic_add_return_acquire(RWAQM_R_BIAS, &sem->cnts);
++	if (likely(!(cnts & RWAQM_W_WMASK))){
++		acqed_func(sem);
++		return;
++	}
++
++	aqm_read_lock_slowpath(sem, 1);
++	acqed_func(sem);
++}
++EXPORT_SYMBOL(bpf_down_read);
++
+ int __must_check down_read_killable(struct rw_semaphore *sem)
+ {
+ 	/* XXX: Will handle the EINTR later */
+@@ -577,10 +761,40 @@ int down_read_trylock(struct rw_semaphore *sem)
+ }
+ EXPORT_SYMBOL(down_read_trylock);
+ 
++int bpf_down_read_trylock(struct rw_semaphore *sem)
++{
++	u32 cnts;
++
++	/** ============ Profiling APIs ================ */
++	lock_contended_func contended_func;
++	contended_func = &custom_lock_contended;
++
++	might_sleep();
++
++	cnts = atomic_read(&sem->cnts);
++	if (likely(!(cnts & RWAQM_W_WMASK))) {
++		cnts = (u32)atomic_add_return_acquire(RWAQM_R_BIAS,
++						      &sem->cnts);
++		if (likely(!(cnts & RWAQM_W_WMASK)))
++			return 1;
++		atomic_sub(RWAQM_R_BIAS, &sem->cnts);
++	}
++	contended_func(sem);
++
++	return 0;
++}
++EXPORT_SYMBOL(bpf_down_read_trylock);
+ 
+-static inline void aqm_write_lock_slowpath(struct rw_semaphore *sem)
++
++static inline void aqm_write_lock_slowpath(struct rw_semaphore *sem, int custom)
+ {
+-	rwmutex_lock(&sem->wait_lock, false);
++	if(custom){
++		lock_contended_func contended_func;
++		contended_func = &custom_lock_contended;
++		contended_func(sem);
++	}
++
++	rwmutex_lock(&sem->wait_lock, false, custom);
+ 
+ 	if (!atomic_read(&sem->cnts) &&
+ 	    (atomic_cmpxchg_acquire(&sem->cnts, 0, RWAQM_W_LOCKED) == 0))
+@@ -601,7 +815,7 @@ static inline void aqm_write_lock_slowpath(struct rw_semaphore *sem)
+ 	} while (atomic_cmpxchg_relaxed(&sem->cnts, RWAQM_W_WAITING,
+ 					RWAQM_W_LOCKED) != RWAQM_W_WAITING);
+      unlock:
+-	rwmutex_unlock(&sem->wait_lock);
++	rwmutex_unlock(&sem->wait_lock, custom);
+ }
+ 
+ /*
+@@ -618,10 +832,38 @@ void down_write(struct rw_semaphore *sem)
+ 	if (likely(atomic_try_cmpxchg_acquire(&sem->cnts, &cnts, RWAQM_W_LOCKED)))
+ 		return;
+ 
+-	aqm_write_lock_slowpath(sem);
++	aqm_write_lock_slowpath(sem, 0);
+ }
+ EXPORT_SYMBOL(down_write);
+ 
++void bpf_down_write(struct rw_semaphore *sem)
++{
++	u32 cnts = 0;
++
++	/** ============ Profiling APIs ================ */
++	lock_acquire_func acq_func;
++	lock_acquired_func acqed_func;
++
++	acq_func = &custom_lock_acquire;
++	acqed_func = &custom_lock_acquired;
++
++	acq_func(sem);
++
++	might_sleep();
++
++	/* if (atomic_long_cmpxchg_acquire(&sem->cnts, 0, RWAQM_W_LOCKED) == 0) */
++	/* 	return; */
++	if (likely(atomic_try_cmpxchg_acquire(&sem->cnts, &cnts, RWAQM_W_LOCKED))){
++		acqed_func(sem);
++		return;
++	}
++
++	aqm_write_lock_slowpath(sem, 1);
++	acqed_func(sem);
++}
++EXPORT_SYMBOL(bpf_down_write);
++
++
+ int __must_check down_write_killable(struct rw_semaphore *sem)
+ {
+ 	down_write(sem);
+@@ -649,6 +891,29 @@ int down_write_trylock(struct rw_semaphore *sem)
+ }
+ EXPORT_SYMBOL(down_write_trylock);
+ 
++int bpf_down_write_trylock(struct rw_semaphore *sem)
++{
++	u32 cnts;
++
++	/** ============ Profiling APIs ================ */
++	lock_contended_func contended_func;
++	contended_func = &custom_lock_contended;
++
++	might_sleep();
++
++	cnts = atomic_read(&sem->cnts);
++	if (unlikely(cnts)){
++		contended_func(sem);
++		return 0;
++	}
++
++	/* return likely(atomic_cmpxchg_acquire(&sem->cnts, */
++	/* 				     &cnts, cnts | RWAQM_W_LOCKED) == cnts); */
++	return likely(atomic_try_cmpxchg_acquire(&sem->cnts, &cnts,
++				RWAQM_W_LOCKED));
++}
++EXPORT_SYMBOL(bpf_down_write_trylock);
++
+ /*
+  * release a read lock
+  */
+@@ -659,6 +924,19 @@ void up_read(struct rw_semaphore *sem)
+ }
+ EXPORT_SYMBOL(up_read);
+ 
++void bpf_up_read(struct rw_semaphore *sem)
++{
++	/** ============ Profiling APIs ================ */
++	lock_release_func rel_func;
++
++	rel_func = &custom_lock_release;
++	rel_func(sem);
++
++	/* (void)atomic_long_sub_return_release(RWAQM_R_BIAS, &sem->cnts); */
++	(void)atomic_sub_return_release(RWAQM_R_BIAS, &sem->cnts);
++}
++EXPORT_SYMBOL(bpf_up_read);
++
+ /*
+  * release a write lock
+  */
+@@ -668,6 +946,19 @@ void up_write(struct rw_semaphore *sem)
+ }
+ EXPORT_SYMBOL(up_write);
+ 
++void bpf_up_write(struct rw_semaphore *sem)
++{
++	/** ============ Profiling APIs ================ */
++	lock_release_func rel_func;
++
++	rel_func = &custom_lock_release;
++	rel_func(sem);
++
++	smp_store_release(&sem->wlocked, 0);
++}
++EXPORT_SYMBOL(bpf_up_write);
++
++
+ 
+ /*
+  * downgrade write lock to read lock
+@@ -685,16 +976,19 @@ void downgrade_write(struct rw_semaphore *sem)
+ }
+ EXPORT_SYMBOL(downgrade_write);
+ 
+-inline void __down_read(struct rw_semaphore *sem)
++void __down_read(struct rw_semaphore *sem)
+ {
+ 	if (!down_read_trylock(sem))
+ 		down_read(sem);
+ }
++EXPORT_SYMBOL(__down_read);
++
+ 
+-inline void __up_read(struct rw_semaphore *sem)
++void __up_read(struct rw_semaphore *sem)
+ {
+ 	up_read(sem);
+ }
++EXPORT_SYMBOL(__up_read);
+ 
+ void __init_rwsem(struct rw_semaphore *sem, const char *name,
+ 		  struct lock_class_key *key)
