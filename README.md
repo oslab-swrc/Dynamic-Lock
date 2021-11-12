@@ -47,28 +47,26 @@ $ python3 concord.py -v --linux_src ../linux \
    shuffling-off policy disables the shuffling mechanisms.
 
 	To enable a policy, first pin eBPF program under BPFFS.
-
-```
-(VM)$ sudo mount bpffs -t bpf /sys/fs/bpf
-(VM)$ sudo ./eBPFGen/<policy-name>/<policy-name>
-```
+	```
+	(VM)$ sudo mount bpffs -t bpf /sys/fs/bpf
+	(VM)$ sudo ./eBPFGen/<policy-name>/<policy-name>
+	```
 
 	Then you can see the following message.
-
-```
-./eBPFGen/<policy-name> loaded
-prog loaded well
-```
+	```
+	./eBPFGen/<policy-name> loaded
+	prog loaded well
+	```
 
 	Enable the policy by inserting livepatch module.
-
-```
-(VM)$ sudo insmod ./Livepatch/shfllock/livepatch-concord.ko
-```
+	```
+	(VM)$ sudo insmod ./Livepatch/shfllock/livepatch-concord.ko
+	```
 
 	Now the policy is enabled.
 
-6. To disable the policy, run the following script.
+
+5. To disable the policy, run the following script.
 
 ```
 (VM)$ echo 0 > /sys/kernel/livepatch/livepatch_concord/enabled
