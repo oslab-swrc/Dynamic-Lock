@@ -1,0 +1,490 @@
+From 482f2727e3ddd61dfa14307aa2e071716cb6a8ab Mon Sep 17 00:00:00 2001
+From: Sujin Park <sujin.park@gatech.edu>
+Date: Fri, 12 Nov 2021 02:20:07 +0100
+Subject: [PATCH] linux modification for Dynamic lock support
+
+---
+ linux/include/linux/bpf.h         |   8 +++
+ linux/include/linux/bpf_types.h   |   1 +
+ linux/include/linux/filter.h      |   2 +-
+ linux/include/linux/lock_policy.h |  56 +++++++++++++++
+ linux/include/linux/mm.h          |   2 +-
+ linux/include/uapi/linux/bpf.h    |   2 +
+ linux/kernel/bpf/core.c           |   1 +
+ linux/kernel/bpf/helpers.c        |  28 ++++++++
+ linux/kernel/bpf/syscall.c        |   1 +
+ linux/kernel/bpf/verifier.c       |   4 +-
+ linux/kernel/trace/bpf_trace.c    |  10 +--
+ linux/net/core/filter.c           | 113 ++++++++++++++++++++++++++++++
+ linux/tools/bpf/bpftool/main.h    |   1 +
+ 13 files changed, 222 insertions(+), 7 deletions(-)
+ create mode 100644 linux/include/linux/lock_policy.h
+
+diff --git a/linux/include/linux/bpf.h b/linux/include/linux/bpf.h
+index 3bf3835d0..e7981b021 100644
+--- a/linux/include/linux/bpf.h
++++ b/linux/include/linux/bpf.h
+@@ -211,6 +211,7 @@ enum bpf_arg_type {
+ 	ARG_PTR_TO_INT,		/* pointer to int */
+ 	ARG_PTR_TO_LONG,	/* pointer to long */
+ 	ARG_PTR_TO_SOCKET,	/* pointer to bpf_sock (fullsock) */
++	ARG_PTR_TO_QSPINLOCK,	/* pointer to qspinlock */
+ };
+ 
+ /* type of values returned from helper functions */
+@@ -281,6 +282,7 @@ enum bpf_reg_type {
+ 	PTR_TO_TCP_SOCK_OR_NULL, /* reg points to struct tcp_sock or NULL */
+ 	PTR_TO_TP_BUFFER,	 /* reg points to a writable raw tp's buffer */
+ 	PTR_TO_XDP_SOCK,	 /* reg points to struct xdp_sock */
++	PTR_TO_QSPINLOCK,	 /* reg points to struct qspinlock */
+ };
+ 
+ /* The information passed from prog-specific *_is_valid_access
+@@ -1025,6 +1027,7 @@ static inline int bpf_fd_reuseport_array_update_elem(struct bpf_map *map,
+ #endif /* defined(CONFIG_INET) && defined(CONFIG_BPF_SYSCALL) */
+ 
+ /* verifier prototypes for helper functions called from eBPF programs */
++extern const struct bpf_func_proto bpf_back_off_proto;
+ extern const struct bpf_func_proto bpf_map_lookup_elem_proto;
+ extern const struct bpf_func_proto bpf_map_update_elem_proto;
+ extern const struct bpf_func_proto bpf_map_delete_elem_proto;
+@@ -1056,6 +1059,11 @@ extern const struct bpf_func_proto bpf_strtol_proto;
+ extern const struct bpf_func_proto bpf_strtoul_proto;
+ extern const struct bpf_func_proto bpf_tcp_sock_proto;
+ 
++extern const struct bpf_func_proto bpf_perf_event_output_proto;
++extern const struct bpf_func_proto bpf_get_current_task_proto;
++extern const struct bpf_func_proto bpf_probe_read_proto;
++extern const struct bpf_func_proto bpf_probe_write_user_proto;
++
+ /* Shared helpers among cBPF and eBPF. */
+ void bpf_user_rnd_init_once(void);
+ u64 bpf_user_rnd_u32(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+diff --git a/linux/include/linux/bpf_types.h b/linux/include/linux/bpf_types.h
+index 36a9c2325..f1f378394 100644
+--- a/linux/include/linux/bpf_types.h
++++ b/linux/include/linux/bpf_types.h
+@@ -6,6 +6,7 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_SOCKET_FILTER, sk_filter)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED_CLS, tc_cls_act)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED_ACT, tc_cls_act)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_XDP, xdp)
++BPF_PROG_TYPE(BPF_PROG_TYPE_LOCK_POLICY, lock_policy)
+ #ifdef CONFIG_CGROUP_BPF
+ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SKB, cg_skb)
+ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCK, cg_sock)
+diff --git a/linux/include/linux/filter.h b/linux/include/linux/filter.h
+index 0367a75f8..bfee65dad 100644
+--- a/linux/include/linux/filter.h
++++ b/linux/include/linux/filter.h
+@@ -556,7 +556,7 @@ DECLARE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
+ #define BPF_PROG_RUN(prog, ctx)	({				\
+ 	u32 ret;						\
+ 	cant_sleep();						\
+-	if (static_branch_unlikely(&bpf_stats_enabled_key)) {	\
++	if (unlikely(static_key_enabled(&bpf_stats_enabled_key))) {	\
+ 		struct bpf_prog_stats *stats;			\
+ 		u64 start = sched_clock();			\
+ 		ret = (*(prog)->bpf_func)(ctx, (prog)->insnsi);	\
+diff --git a/linux/include/linux/lock_policy.h b/linux/include/linux/lock_policy.h
+new file mode 100644
+index 000000000..2db89a1a2
+--- /dev/null
++++ b/linux/include/linux/lock_policy.h
+@@ -0,0 +1,56 @@
++#ifndef __LINUX_LOCK_POLICY_H__
++#define __LINUX_LOCK_POLICY_H__
++
++/* Comment out below line if per-cpu data is not needed. */
++#define DEFINE_PER_CPU_DATA
++
++struct __attribute__((aligned(64))) __aligned_u64_field {
++	unsigned long field;
++};
++
++/*
++ * User accessible mirror of in-kernel lock_policy_args.
++ */
++struct __lock_policy_args {
++	/* User-defined additional data */
++
++#ifdef DEFINE_PER_CPU_DATA
++	/* type should match with `__aligned_u64_field->field` */
++	unsigned long per_cpu_data;
++#endif
++};
++
++
++/*
++ * This is the struct to be passed to bpf lock policy
++ */
++struct lock_policy_args {
++	/* User-defined additional data */
++
++#ifdef DEFINE_PER_CPU_DATA
++	struct __aligned_u64_field *per_cpu_data;
++	unsigned long tmp_reg;
++#endif
++};
++
++/*
++ * This is for additional data per lock instance, which
++ * will be allocated and attached as shadow variable.
++ */
++struct per_lock_data {
++	/* User-defined additional data */
++
++#ifdef DEFINE_PER_CPU_DATA
++	struct __aligned_u64_field per_cpu_data[224];
++#endif
++};
++
++/*
++ * This is for additional data per node, which will be
++ * allocated in stack.
++ */
++struct per_node_data {
++	/* User-defined additional data */
++};
++
++#endif /* __LINUX_LOCK_POLICY_H__ */
+diff --git a/linux/include/linux/mm.h b/linux/include/linux/mm.h
+index a2adf95b3..fd2aaf084 100644
+--- a/linux/include/linux/mm.h
++++ b/linux/include/linux/mm.h
+@@ -971,7 +971,7 @@ void __put_devmap_managed_page(struct page *page);
+ DECLARE_STATIC_KEY_FALSE(devmap_managed_key);
+ static inline bool put_devmap_managed_page(struct page *page)
+ {
+-	if (!static_branch_unlikely(&devmap_managed_key))
++	if (!unlikely(static_key_enabled(&devmap_managed_key)))
+ 		return false;
+ 	if (!is_zone_device_page(page))
+ 		return false;
+diff --git a/linux/include/uapi/linux/bpf.h b/linux/include/uapi/linux/bpf.h
+index 77c6be96d..fb6abb165 100644
+--- a/linux/include/uapi/linux/bpf.h
++++ b/linux/include/uapi/linux/bpf.h
+@@ -173,6 +173,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_CGROUP_SYSCTL,
+ 	BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
+ 	BPF_PROG_TYPE_CGROUP_SOCKOPT,
++	BPF_PROG_TYPE_LOCK_POLICY,
+ };
+ 
+ enum bpf_attach_type {
+@@ -2753,6 +2754,7 @@ union bpf_attr {
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
++	FN(back_off),		\
+ 	FN(map_lookup_elem),		\
+ 	FN(map_update_elem),		\
+ 	FN(map_delete_elem),		\
+diff --git a/linux/kernel/bpf/core.c b/linux/kernel/bpf/core.c
+index ef0e1e3e6..e982833a9 100644
+--- a/linux/kernel/bpf/core.c
++++ b/linux/kernel/bpf/core.c
+@@ -2023,6 +2023,7 @@ BPF_CALL_0(bpf_user_rnd_u32)
+ }
+ 
+ /* Weak definitions of helper functions in case we don't have bpf syscall. */
++const struct bpf_func_proto bpf_back_off_proto __weak;
+ const struct bpf_func_proto bpf_map_lookup_elem_proto __weak;
+ const struct bpf_func_proto bpf_map_update_elem_proto __weak;
+ const struct bpf_func_proto bpf_map_delete_elem_proto __weak;
+diff --git a/linux/kernel/bpf/helpers.c b/linux/kernel/bpf/helpers.c
+index 5e2871892..6be0be136 100644
+--- a/linux/kernel/bpf/helpers.c
++++ b/linux/kernel/bpf/helpers.c
+@@ -23,6 +23,34 @@
+  * if program is allowed to access maps, so check rcu_read_lock_held in
+  * all three functions.
+  */
++
++BPF_CALL_2(bpf_back_off, u64, lock, u64, timeout)
++{
++	unsigned long enter_time = ktime_get_mono_fast_ns();
++	unsigned long counter = 0, time_to_check = 1;
++	struct qspinlock *l = (struct qspinlock*)lock;
++
++	do {
++		if(++counter == time_to_check) {
++			if(atomic_read_acquire(&l->val) == 0)
++				return 1;
++			time_to_check *= 2;
++		}
++		cpu_relax();
++	} while (ktime_get_mono_fast_ns() - enter_time < timeout);
++
++	return 0;
++}
++
++const struct bpf_func_proto bpf_back_off_proto = {
++	.func		= bpf_back_off,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_ANYTHING,
++	.arg2_type	= ARG_ANYTHING,
++};
++
+ BPF_CALL_2(bpf_map_lookup_elem, struct bpf_map *, map, void *, key)
+ {
+ 	WARN_ON_ONCE(!rcu_read_lock_held());
+diff --git a/linux/kernel/bpf/syscall.c b/linux/kernel/bpf/syscall.c
+index ace1cfaa2..f8aa6919d 100644
+--- a/linux/kernel/bpf/syscall.c
++++ b/linux/kernel/bpf/syscall.c
+@@ -1663,6 +1663,7 @@ static int bpf_prog_load(union bpf_attr *attr, union bpf_attr __user *uattr)
+ 		return -E2BIG;
+ 	if (type != BPF_PROG_TYPE_SOCKET_FILTER &&
+ 	    type != BPF_PROG_TYPE_CGROUP_SKB &&
++		type != BPF_PROG_TYPE_LOCK_POLICY &&
+ 	    !capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+diff --git a/linux/kernel/bpf/verifier.c b/linux/kernel/bpf/verifier.c
+index ffc3e53f5..7320f1f49 100644
+--- a/linux/kernel/bpf/verifier.c
++++ b/linux/kernel/bpf/verifier.c
+@@ -5995,6 +5995,7 @@ static bool may_access_skb(enum bpf_prog_type type)
+ 	case BPF_PROG_TYPE_SOCKET_FILTER:
+ 	case BPF_PROG_TYPE_SCHED_CLS:
+ 	case BPF_PROG_TYPE_SCHED_ACT:
++	case BPF_PROG_TYPE_LOCK_POLICY:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -7865,7 +7866,8 @@ static int check_map_prog_compatibility(struct bpf_verifier_env *env,
+ 	}
+ 
+ 	if ((is_tracing_prog_type(prog->type) ||
+-	     prog->type == BPF_PROG_TYPE_SOCKET_FILTER) &&
++	     prog->type == BPF_PROG_TYPE_SOCKET_FILTER ||
++		 prog->type == BPF_PROG_TYPE_LOCK_POLICY) &&
+ 	    map_value_has_spin_lock(map)) {
+ 		verbose(env, "tracing progs cannot use bpf_spin_lock yet\n");
+ 		return -EINVAL;
+diff --git a/linux/kernel/trace/bpf_trace.c b/linux/kernel/trace/bpf_trace.c
+index 44bd08f24..fc241937b 100644
+--- a/linux/kernel/trace/bpf_trace.c
++++ b/linux/kernel/trace/bpf_trace.c
+@@ -154,7 +154,7 @@ BPF_CALL_3(bpf_probe_read, void *, dst, u32, size, const void *, unsafe_ptr)
+ 	return ret;
+ }
+ 
+-static const struct bpf_func_proto bpf_probe_read_proto = {
++const struct bpf_func_proto bpf_probe_read_proto = {
+ 	.func		= bpf_probe_read,
+ 	.gpl_only	= true,
+ 	.ret_type	= RET_INTEGER,
+@@ -192,7 +192,7 @@ BPF_CALL_3(bpf_probe_write_user, void *, unsafe_ptr, const void *, src,
+ 	return probe_kernel_write(unsafe_ptr, src, size);
+ }
+ 
+-static const struct bpf_func_proto bpf_probe_write_user_proto = {
++const struct bpf_func_proto bpf_probe_write_user_proto = {
+ 	.func		= bpf_probe_write_user,
+ 	.gpl_only	= true,
+ 	.ret_type	= RET_INTEGER,
+@@ -494,7 +494,7 @@ BPF_CALL_5(bpf_perf_event_output, struct pt_regs *, regs, struct bpf_map *, map,
+ 	return err;
+ }
+ 
+-static const struct bpf_func_proto bpf_perf_event_output_proto = {
++const struct bpf_func_proto bpf_perf_event_output_proto = {
+ 	.func		= bpf_perf_event_output,
+ 	.gpl_only	= true,
+ 	.ret_type	= RET_INTEGER,
+@@ -556,7 +556,7 @@ BPF_CALL_0(bpf_get_current_task)
+ 	return (long) current;
+ }
+ 
+-static const struct bpf_func_proto bpf_get_current_task_proto = {
++const struct bpf_func_proto bpf_get_current_task_proto = {
+ 	.func		= bpf_get_current_task,
+ 	.gpl_only	= true,
+ 	.ret_type	= RET_INTEGER,
+@@ -687,6 +687,8 @@ static const struct bpf_func_proto *
+ tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ {
+ 	switch (func_id) {
++	case BPF_FUNC_back_off:
++		return &bpf_back_off_proto;
+ 	case BPF_FUNC_map_lookup_elem:
+ 		return &bpf_map_lookup_elem_proto;
+ 	case BPF_FUNC_map_update_elem:
+diff --git a/linux/net/core/filter.c b/linux/net/core/filter.c
+index 3fed57554..421ae5052 100644
+--- a/linux/net/core/filter.c
++++ b/linux/net/core/filter.c
+@@ -74,6 +74,8 @@
+ #include <net/ipv6_stubs.h>
+ #include <net/bpf_sk_storage.h>
+ 
++#include <linux/lock_policy.h>
++
+ /**
+  *	sk_filter_trim_cap - run a packet through a socket filter
+  *	@sk: sock associated with &sk_buff
+@@ -5966,6 +5968,8 @@ static const struct bpf_func_proto *
+ bpf_base_func_proto(enum bpf_func_id func_id)
+ {
+ 	switch (func_id) {
++	case BPF_FUNC_back_off:
++		return &bpf_back_off_proto;
+ 	case BPF_FUNC_map_lookup_elem:
+ 		return &bpf_map_lookup_elem_proto;
+ 	case BPF_FUNC_map_update_elem:
+@@ -6082,6 +6086,27 @@ sk_filter_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 	}
+ }
+ 
++static const struct bpf_func_proto *
++lock_policy_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	switch (func_id) {
++	case BPF_FUNC_get_current_pid_tgid:
++		return &bpf_get_current_pid_tgid_proto;
++	case BPF_FUNC_get_stackid:
++		return &bpf_get_stackid_proto;
++	case BPF_FUNC_get_current_comm:
++		return &bpf_get_current_comm_proto;
++	case BPF_FUNC_perf_event_output:
++		return &bpf_perf_event_output_proto;
++	case BPF_FUNC_probe_read:
++		return &bpf_probe_read_proto;
++	case BPF_FUNC_probe_write_user:
++		return &bpf_probe_write_user_proto;
++	default:
++		return bpf_base_func_proto(func_id);
++	}
++}
++
+ const struct bpf_func_proto bpf_sk_storage_get_proto __weak;
+ const struct bpf_func_proto bpf_sk_storage_delete_proto __weak;
+ 
+@@ -6553,6 +6578,15 @@ static bool sk_filter_is_valid_access(int off, int size,
+ 	return bpf_skb_is_valid_access(off, size, type, prog, info);
+ }
+ 
++static bool lock_policy_is_valid_access(int off, int size,
++				   enum bpf_access_type type,
++				   const struct bpf_prog *prog,
++				   struct bpf_insn_access_aux *info)
++{
++	/** return bpf_skb_is_valid_access(off, size, type, prog, info); */
++	return true;
++}
++
+ static bool cg_skb_is_valid_access(int off, int size,
+ 				   enum bpf_access_type type,
+ 				   const struct bpf_prog *prog,
+@@ -7762,6 +7796,76 @@ static u32 tc_cls_act_convert_ctx_access(enum bpf_access_type type,
+ 	return insn - insn_buf;
+ }
+ 
++static u32 lock_policy_ctx_access(enum bpf_access_type type,
++				  const struct bpf_insn *si,
++				  struct bpf_insn *insn_buf,
++				  struct bpf_prog *prog, u32 *target_size)
++{
++	struct bpf_insn *insn = insn_buf;
++	int off = 0;
++
++	switch (si->off){
++
++#ifdef DEFINE_PER_CPU_DATA
++	case offsetof(struct __lock_policy_args, per_cpu_data):
++		// TODO: Let per-cpu-data as an array, need to modify off.
++
++		if (type == BPF_WRITE){
++			// nested store
++
++			int tmp_reg = BPF_REG_9;
++			if (si->src_reg == tmp_reg || si->dst_reg == tmp_reg)
++				--tmp_reg;
++			if (si->src_reg == tmp_reg || si->dst_reg == tmp_reg)
++				--tmp_reg;
++
++			*insn++ = BPF_STX_MEM(BPF_DW, si->dst_reg, tmp_reg,
++				offsetof(struct lock_policy_args, tmp_reg));
++
++			*insn++ = BPF_LDX_MEM(
++				BPF_FIELD_SIZEOF(struct lock_policy_args, per_cpu_data),
++				tmp_reg, si->dst_reg,
++				offsetof(struct lock_policy_args, per_cpu_data));
++
++			*insn++ = BPF_STX_MEM(
++				BPF_FIELD_SIZEOF(struct __lock_policy_args, per_cpu_data),
++				tmp_reg, si->src_reg,
++				off);
++
++			*insn++ = BPF_LDX_MEM(BPF_DW, tmp_reg, si->dst_reg,
++				offsetof(struct lock_policy_args, tmp_reg));
++
++		}
++		else{
++			*insn++ = BPF_LDX_MEM(
++				BPF_FIELD_SIZEOF(struct lock_policy_args, per_cpu_data),
++				si->dst_reg, si->src_reg,
++				offsetof(struct lock_policy_args, per_cpu_data));
++
++			*insn++ = BPF_LDX_MEM(
++				BPF_FIELD_SIZEOF(struct __lock_policy_args, per_cpu_data),
++				si->dst_reg, si->dst_reg,
++				off);
++		}
++
++		break;
++#endif
++
++	default:
++		if (type == BPF_WRITE)
++			*insn++ = BPF_STX_MEM(BPF_SIZEOF(unsigned long),
++						  si->dst_reg, si->src_reg,
++						  si->off);
++		else
++			*insn++ = BPF_LDX_MEM(BPF_SIZEOF(unsigned long),
++						  si->dst_reg, si->src_reg,
++						  si->off);
++		break;
++	}
++
++	return insn - insn_buf;
++}
++
+ static u32 xdp_convert_ctx_access(enum bpf_access_type type,
+ 				  const struct bpf_insn *si,
+ 				  struct bpf_insn *insn_buf,
+@@ -8475,6 +8579,15 @@ const struct bpf_prog_ops sk_filter_prog_ops = {
+ 	.test_run		= bpf_prog_test_run_skb,
+ };
+ 
++const struct bpf_verifier_ops lock_policy_verifier_ops = {
++	.get_func_proto		= lock_policy_func_proto,
++	.is_valid_access	= lock_policy_is_valid_access,
++	.convert_ctx_access = lock_policy_ctx_access,
++};
++
++const struct bpf_prog_ops lock_policy_prog_ops = {
++};
++
+ const struct bpf_verifier_ops tc_cls_act_verifier_ops = {
+ 	.get_func_proto		= tc_cls_act_func_proto,
+ 	.is_valid_access	= tc_cls_act_is_valid_access,
+diff --git a/linux/tools/bpf/bpftool/main.h b/linux/tools/bpf/bpftool/main.h
+index af9ad56c3..b4def49d9 100644
+--- a/linux/tools/bpf/bpftool/main.h
++++ b/linux/tools/bpf/bpftool/main.h
+@@ -76,6 +76,7 @@ static const char * const prog_type_name[] = {
+ 	[BPF_PROG_TYPE_CGROUP_SYSCTL]		= "cgroup_sysctl",
+ 	[BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE]	= "raw_tracepoint_writable",
+ 	[BPF_PROG_TYPE_CGROUP_SOCKOPT]		= "cgroup_sockopt",
++	[BPF_PROG_TYPE_LOCK_POLICY]		= "lock_policy",
+ };
+ 
+ extern const char * const map_type_name[];
+-- 
+2.25.1
+
