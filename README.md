@@ -27,11 +27,13 @@ reboot the whole system.
    First, make sure `./linux` directory is clean v5.4 source code.
    Then run the following script to expose APIs.
 
-	$ cd concord
-	$ python3 concord.py -v --linux_src ../linux \
-		--lock lockdir/shfllock.patch \
-		--policy policy/numa-grouping \
-		--livepatch kpatch/patches/shfl-on-qspin.patch
+```
+$ cd concord
+$ python3 concord.py -v --linux_src ../linux \
+	--lock lockdir/shfllock.patch \
+	--policy policy/numa-grouping \
+	--livepatch kpatch/patches/shfl-on-qspin.patch
+```
 
 2. Start VM and pin vcpu. Or you can run on the host machine with compiled linux
    kernel.
@@ -46,29 +48,30 @@ reboot the whole system.
 
 	To enable a policy, first pin eBPF program under BPFFS.
 
-
-	(VM)$ sudo mount bpffs -t bpf /sys/fs/bpf
-	(VM)$ sudo ./eBPFGen/<policy-name>/<policy-name>
-
+```
+(VM)$ sudo mount bpffs -t bpf /sys/fs/bpf
+(VM)$ sudo ./eBPFGen/<policy-name>/<policy-name>
+```
 
 	Then you can see the following message.
 
-
-	./eBPFGen/<policy-name> loaded
-	prog loaded well
-
+```
+./eBPFGen/<policy-name> loaded
+prog loaded well
+```
 
 	Enable the policy by inserting livepatch module.
 
-
-	(VM)$ sudo insmod ./Livepatch/shfllock/livepatch-concord.ko
-
+```
+(VM)$ sudo insmod ./Livepatch/shfllock/livepatch-concord.ko
+```
 
 	Now the policy is enabled.
 
 6. To disable the policy, run the following script.
 
-
-	(VM)$ echo 0 > /sys/kernel/livepatch/livepatch_concord/enabled
-	(VM)$ rm /sys/fs/bpf/*
-	(VM)$ sudo rmmod livepatch_concord
+```
+(VM)$ echo 0 > /sys/kernel/livepatch/livepatch_concord/enabled
+(VM)$ rm /sys/fs/bpf/*
+(VM)$ sudo rmmod livepatch_concord
+```
