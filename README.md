@@ -84,9 +84,9 @@ the directory would be the policy name.
 
 Inside the directory, you need following files:
 
-	- `concord.h` : Copy of `./concord/policy/concord.h`. You can modify this
+- `concord.h` : Copy of `./concord/policy/concord.h`. You can modify this
 	  file to add auxiliary data per thread node or per lock.
-	- `<function_name>.pfile` : An simplified eBPF code to create lock policy.
+- `<function_name>.pfile` : An simplified eBPF code to create lock policy.
 	  You can have multiples of pfile in the directory.
 
 `concord/policy/numa-grouping` directory is a simple example policy working on
