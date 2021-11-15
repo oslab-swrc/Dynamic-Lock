@@ -63,7 +63,7 @@ $ python3 concord.py -v --linux_src ../linux \
 	(VM)$ sudo insmod ./Livepatch/shfllock/livepatch-concord.ko
 	```
 
-	Now the policy is enabled.
+Now the policy is enabled.
 
 
 5. To disable the policy, run the following script.
@@ -73,3 +73,30 @@ $ python3 concord.py -v --linux_src ../linux \
 (VM)$ rm /sys/fs/bpf/*
 (VM)$ sudo rmmod livepatch_concord
 ```
+
+## How to make a policy
+
+With concord, user can create own custom policy in userspace and dynamically
+enable/disable it.
+
+You can start from creating a directory under `./concord/policy`. The name of
+the directory would be the policy name.
+
+Inside the directory, you need following files:
+
+	- `concord.h` : Copy of `./concord/policy/concord.h`. You can modify this
+	  file to add auxiliary data per thread node or per lock.
+	- `<function_name>.pfile` : An simplified eBPF code to create lock policy.
+	  You can have multiples of pfile in the directory.
+
+`concord/policy/numa-grouping` directory is a simple example policy working on
+top of shfllock. Inside the `numa-grouping.h` file, you can find that the policy
+requires `nid` variable per node.
+
+Inside the `numa-grouping.pfile` file, it compares the socket id of current node
+and anchor node. The result will be used inside the `shuffle_waiters` of
+shfllock whether to move current node forward.
+
+In addition to the `custom_cmp_func()` API used in `numa-grouping.pfile`,
+Concord provides several APIs. You can find the list under
+`concord/lockdir/list_APIs.h`.
